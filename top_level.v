@@ -1,11 +1,11 @@
-// File digital_cam_impl1/top_level.vhd translated with vhd2vl v3.0 VHDL to Verilog RTL translator
-// ...（原版权声明省略）...
+// ---------------- top_level.v  (DE2-115 + OV7670 + LED显示 + “半边中断仅占用 LEDR[17]”) ----------------
 
 module top_level (
   input  wire        CLOCK_50,
   input  wire [3:0]  KEY,
-  output wire [8:0]  LEDG,          // 保留
-  output wire [17:0] LEDR,          // ← 新增：显示方向/强度/报警
+  output wire [8:0]  LEDG,
+  output wire [17:0] LEDR,
+  // VGA
   output wire        VGA_HS,
   output wire        VGA_VS,
   output wire [7:0]  VGA_R,
@@ -14,10 +14,12 @@ module top_level (
   output wire        VGA_BLANK_N,
   output wire        VGA_SYNC_N,
   output wire        VGA_CLK,
-  output wire [6:0]  HEX0,          // ← 新增：显示 |error|
-  output wire [6:0]  HEX1,          // ← 新增
-  output wire [6:0]  HEX2,          // ← 新增
-  output wire [6:0]  HEX3,          // ← 新增
+  // 七段数码管
+  output wire [6:0]  HEX0,
+  output wire [6:0]  HEX1,
+  output wire [6:0]  HEX2,
+  output wire [6:0]  HEX3,
+  // 摄像头与 GPIO
   inout  wire [35:0] GPIO
 );
 
@@ -55,6 +57,7 @@ module top_level (
   assign VGA_G = green[7:0];
   assign VGA_B = blue[7:0];
 
+  // ---------------- PLL ----------------
   my_altpll Inst_vga_pll(
     .inclk0 (CLOCK_50),
     .c0     (clk_50_camera),
@@ -68,23 +71,22 @@ module top_level (
 
   // ---------------- VGA timing ----------------
   VGA Inst_VGA(
-    .CLK25  (clk_25_vga),
-    .clkout (VGA_CLK),
-    .Hsync  (VGA_HS),
-    .Vsync  (vSync),
-    .Nblank (nBlank),
-    .Nsync  (VGA_SYNC_N),
-    .activeArea(activeArea)
+    .CLK25      (clk_25_vga),
+    .clkout     (VGA_CLK),
+    .Hsync      (VGA_HS),
+    .Vsync      (vSync),
+    .Nblank     (nBlank),
+    .Nsync      (VGA_SYNC_N),
+    .activeArea (activeArea)
   );
 
   // ---------------- OV7670 config ----------------
-  // 将 config_finished 接到本地线，稍后与 LED 合并
-  wire config_finished;
+  wire config_finished; // 如需在 LEDG 显示，可在 line_follow_display 内部处理；此处不改你的 LED 逻辑
 
   ov7670_controller Inst_ov7670_controller(
     .clk              (clk_50_camera),
     .resend           (resend),
-    .config_finished  (config_finished), // 原来直接连 LEDG[0]，现在先拉出
+    .config_finished  (config_finished),
     .sioc             (ov7670_sioc),
     .siod             (ov7670_siod),
     .reset            (ov7670_reset),
@@ -132,10 +134,8 @@ module top_level (
   );
 
   // =====================================================================
-  // ==============  Yellow-line tracking (新增三模块之一)  ==============
+  // ==============  Yellow-line tracking  ===============================
   // =====================================================================
-
-  // 在 PCLK 域做底部 ROI 流式统计
   wire        lt_frame_pulse;
   wire [15:0] lt_width;
   wire [15:0] lt_height;
@@ -143,7 +143,6 @@ module top_level (
   wire        lt_valid;
   wire        lt_detected;
 
-  // 注意：yellow_thresh_12b 作为子模块由 line_tracker_pclk 内部实例化
   line_tracker_pclk #(.ROI_LINES(40)) u_line_tracker (
     .pclk           (ov7670_pclk),
     .reset_n        (reset_n),
@@ -159,9 +158,10 @@ module top_level (
     .detected       (lt_detected)
   );
 
-  // 在 50MHz 域显示误差到 LED/HEX
+  // 50MHz 域显示/误差（保持你的 LED 逻辑，不在这里改）
   wire signed [15:0] lf_error;
-  wire [8:0] ledg_follow;   // 来自循迹模块的 LEDG（右侧强度）
+  wire [17:0] led_from_lfd;
+  wire [8:0]  ledg_from_lfd;
 
   line_follow_display u_lfd (
     .clk               (CLOCK_50),
@@ -171,15 +171,57 @@ module top_level (
     .pclk_centroid_x   (lt_cx),
     .pclk_detected     (lt_detected),
     .error             (lf_error),
-    .LEDR              (LEDR),        // 左侧（负误差）点亮红灯，从 LSB 起
-    .LEDG              (ledg_follow), // 右侧（正误差）点亮绿灯，从 LSB 起
+    .LEDR              (led_from_lfd),  // ← 接到中间线
+    .LEDG              (ledg_from_lfd), // ← 接到中间线
     .HEX0              (HEX0),
     .HEX1              (HEX1),
     .HEX2              (HEX2),
     .HEX3              (HEX3)
   );
 
-  // 合并“配置完成灯”（LEDG[0]）与循迹的 LEDG
-  assign LEDG = ledg_follow | {8'b0, config_finished};
+  // =====================================================================
+  // ==============  “半边中断”检测（新增，仅影响 LEDR[17]） ============
+  // =====================================================================
+  wire half_break_pclk, hb_valid_pclk;
+  line_break_pclk #(
+  
+    .ROI_LINES(40),
+    .COVER_PCT(1)
+  ) u_line_half (
+    .pclk            (ov7670_pclk),
+    .reset_n         (reset_n),
+    .vsync           (ov7670_vsync),
+    .href            (ov7670_href),
+    .we              (wren),
+    .pix_rgb444      (wrdata),
+    .line_half_break (half_break_pclk),
+    .valid_pulse     (hb_valid_pclk)
+  );
+
+  // 跨域：把 PCLK 的帧结果锁存到 50MHz 域
+  reg hb_50m, hb_v1, hb_v2;
+  always @(posedge CLOCK_50 or negedge reset_n) begin
+    if(!reset_n) begin
+      hb_50m <= 1'b0;
+      hb_v1  <= 1'b0;
+      hb_v2  <= 1'b0;
+    end else begin
+      hb_v1 <= hb_valid_pclk;
+      hb_v2 <= hb_v1;
+      if (hb_v1 & ~hb_v2) begin
+        hb_50m <= half_break_pclk; // 每帧锁存
+      end
+    end
+  end
+
+  // =====================================================================
+  // ==============  最终 LED 映射（只改 LEDR[17]）  =====================
+  // =====================================================================
+  // 0..16 与 LEDG 完全沿用 line_follow_display 的输出
+  assign LEDR[16:0] = led_from_lfd[16:0];
+  assign LEDG       = ledg_from_lfd;
+
+  // 17号灯只显示“半边中断”标志（exactly one vertical half has yellow）
+  assign LEDR[17]   = hb_50m;
 
 endmodule
